@@ -1,5 +1,6 @@
 import os
 import re
+import uuid
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, TextIO, Type, Union, List
@@ -8,6 +9,7 @@ import logging
 import yaml
 import docker
 
+from snowshu.configs import Architecture, ARCH_MAP
 if TYPE_CHECKING:
     from snowshu.adapters.base_sql_adapter import BaseSQLAdapter
     from snowshu.adapters.source_adapters.base_source_adapter import BaseSourceAdapter
@@ -103,16 +105,23 @@ def fetch_adapter(name: str,
         raise err
 
 
-def get_multiarch_list(local_arch: str) -> List[str]:
-    """ Finds an opposite arch to the one passed here and returns both as a list,
-        ordered in a way that passed arch is first
+def get_multiarch_list(local_arch: Architecture) -> List[Architecture]:
     """
-    if local_arch == 'amd64':
-        return_list = ['amd64', 'arm64']
-    else:
-        return_list = ['arm64', 'amd64']
+    This function generates a list of all known architectures, excluding the 'UNKNOWN' architecture.
+    The list is ordered such that the architecture provided as input is placed at the beginning.
+    """
 
-    return return_list
+    all_archs = list(
+        set(
+            ARCH_MAP[arch].value
+            for arch in Architecture
+            if arch != Architecture.UNKNOWN
+        )
+    )
+    all_archs.remove(ARCH_MAP[local_arch].value)
+    all_archs.insert(0, ARCH_MAP[local_arch].value)
+    logger.info(f"Building for architectures: {all_archs}")
+    return all_archs
 
 
 def remove_dangling_replica_containers() -> None:
@@ -122,3 +131,9 @@ def remove_dangling_replica_containers() -> None:
     for container in client.containers.list(all=True):
         if 'snowshu_target_' in container.name:
             container.remove(force=True)
+
+
+def generate_unique_uuid(is_upper: bool = True) -> str:
+    """Generates a unique name based on name and randomly generated uuid."""
+    _uuid = str(uuid.uuid4()).rsplit('-', maxsplit=1)[-1]
+    return _uuid.upper() if is_upper else _uuid

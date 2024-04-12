@@ -2,10 +2,13 @@ from random import randrange
 
 import pytest
 import yaml
-
+import logging
 
 
 import snowshu.core.models.materializations as mz
+from snowshu.core.utils import generate_unique_uuid
+from snowshu.core.models.attribute import Attribute
+from snowshu.core.models.data_types import DataType
 from snowshu.adapters.source_adapters import BaseSourceAdapter
 from snowshu.adapters.source_adapters.snowflake_adapter import SnowflakeAdapter
 from snowshu.core.models.credentials import Credentials
@@ -54,9 +57,9 @@ def test_directionally_wrap_statement(sf_adapter):
                 {relation.scoped_cte('SNOWSHU_FINAL_SAMPLE')}
             SAMPLE BERNOULLI (50)
             )
-            SELECT 
+            SELECT
                 *
-            FROM 
+            FROM
                 {relation.scoped_cte('SNOWSHU_DIRECTIONAL_SAMPLE')}
             """)
 
@@ -184,11 +187,11 @@ def test_polymorphic_constraint_statement(sf_adapter):
                         schema=SCHEMA,
                         name=TABLE,
                         materialization=[],
-                        attributes=[])
+                        attributes=[Attribute("CHILD_ID", DataType("CHILD_ID", True))])
     relation.core_query = f"""
         SELECT
             *
-        FROM 
+        FROM
             {DATABASE}.{SCHEMA}.{TABLE}
             SAMPLE BERNOULLI (10)
         """
@@ -236,7 +239,7 @@ def test_sample_statement_from_relation(sf_adapter):
     assert query_equalize(sample) == query_equalize(f"""
         SELECT
             *
-        FROM 
+        FROM
             {DATABASE}.{SCHEMA}.{TABLE}
             SAMPLE BERNOULLI (10)
         """)
@@ -293,25 +296,25 @@ def test_predicate_constraint_statement(sf_adapter):
                         schema=SCHEMA,
                         name=TABLE,
                         materialization=[],
-                        attributes=[])
+                        attributes=[Attribute("CHILD_ID", DataType("CHILD_ID", True))])
     relation.core_query = f"""
         SELECT
             *
-        FROM 
+        FROM
             {DATABASE}.{SCHEMA}.{TABLE}
             SAMPLE BERNOULLI (10)
         """
     statement = sf_adapter.predicate_constraint_statement(relation, True, LOCAL_KEY, REMOTE_KEY)
 
     assert query_equalize(statement) == query_equalize(f"""
-        {LOCAL_KEY} IN 
-            ( SELECT  
+        {LOCAL_KEY} IN
+            ( SELECT
                 {REMOTE_KEY}
             AS {LOCAL_KEY}
             FROM (
         SELECT
             *
-        FROM 
+        FROM
             {DATABASE}.{SCHEMA}.{TABLE}
             SAMPLE BERNOULLI (10)
         ))
@@ -324,3 +327,115 @@ def test_check_count_and_query(sf_adapter):
 
     assert exc.errisinstance(TooManyRecords)
     assert sf_adapter.check_count_and_query.retry.statistics["attempt_number"] == 4
+
+
+def test_generate_schema(sf_adapter):
+    """Testing whether schema phisically appears in snowflake warehouse
+    after using snowflake_adapter.generate_schema()"""
+    DATABASE, SCHEMA = (
+        "SNOWSHU_DEVELOPMENT",
+        "_".join(["GENERATE_TEST_SCHEMA", generate_unique_uuid().upper()])
+    )
+    try:
+        # Clean up before test
+        if SCHEMA in sf_adapter._get_all_schemas(DATABASE):
+            sf_adapter.drop_schema(database=DATABASE, name=SCHEMA)
+
+        # Test schema creation
+        sf_adapter.generate_schema(database=DATABASE, name=SCHEMA)
+        assert SCHEMA in sf_adapter._get_all_schemas(database=DATABASE)
+    finally:
+        # Clean up after test
+        sf_adapter.drop_schema(database=DATABASE, name=SCHEMA)
+
+
+def test_drop_schema(sf_adapter):
+    """Test whether snowflake_adapter.drop_schema() successfully
+    drop schema (with cascade) from snowflake warehouse."""
+    DATABASE, SCHEMA = (
+        "SNOWSHU_DEVELOPMENT",
+        "_".join(["DROP_SCHEMA_TEST", generate_unique_uuid().upper()])
+    )
+    try:
+        # Setup: Ensure the schema exists before attempting to drop it
+        if SCHEMA not in sf_adapter._get_all_schemas(DATABASE):
+            sf_adapter.generate_schema(database=DATABASE, name=SCHEMA)
+            assert SCHEMA in sf_adapter._get_all_schemas(DATABASE)
+        # Test schema dropping
+        sf_adapter.drop_schema(database=DATABASE, name=SCHEMA)
+        assert SCHEMA not in sf_adapter._get_all_schemas(DATABASE)
+    finally:
+        # Additional cleanup, in case the test fails
+        if SCHEMA in sf_adapter._get_all_schemas(DATABASE):
+            sf_adapter.drop_schema(database=DATABASE, name=SCHEMA)
+
+
+def test_create_table(sf_adapter):
+    """Test whether snowflake_adapter.create_table() successfully creates
+    a table in snowflake warehouse."""
+    DATABASE, SCHEMA, TABLE = (
+        "SNOWSHU_DEVELOPMENT",
+        "_".join(["CREATE_TABLE_TEST", generate_unique_uuid().upper()]),
+        "TEST_TABLE"
+    )
+    query = "SELECT 1 AS test_col"
+    try:
+        # Setup: Create schema and ensure table does not exist
+        sf_adapter.generate_schema(name=SCHEMA, database=DATABASE)
+        if TABLE in sf_adapter._get_all_tables(DATABASE, SCHEMA):
+            sf_adapter.drop_table(name=TABLE, schema=SCHEMA, database=DATABASE)
+
+        # Test table creation
+        sf_adapter.create_table(query, name=TABLE, schema=SCHEMA, database=DATABASE)
+        assert TABLE in sf_adapter._get_all_tables(DATABASE, SCHEMA)
+    finally:
+        # Clean up after test
+        sf_adapter.drop_table(name=TABLE, schema=SCHEMA, database=DATABASE)
+        sf_adapter.drop_schema(name=SCHEMA, database=DATABASE)
+
+def test_create_table_same_names(sf_adapter, caplog):
+    """Test whether snowflake_adapter.create_table() successfully informs user
+    with a warning that the table already exists when trying to create a table
+    with the same name as an existing one."""
+    DATABASE, SCHEMA, TABLE = (
+        "SNOWSHU_DEVELOPMENT",
+        "_".join(["CREATE_TABLE_TEST", generate_unique_uuid().upper()]),
+        "TEST_TABLE"
+    )
+    query = "SELECT 1 AS test_col"
+    try:
+        # Setup: Create schema and table
+        sf_adapter.generate_schema(name=SCHEMA, database=DATABASE)
+        if TABLE in sf_adapter._get_all_tables(DATABASE, SCHEMA):
+            sf_adapter.drop_table(name=TABLE, schema=SCHEMA, database=DATABASE)
+        sf_adapter.create_table(query, name=TABLE, schema=SCHEMA, database=DATABASE)
+        with caplog.at_level(logging.WARNING):
+            sf_adapter.create_table(query, name=TABLE, schema=SCHEMA, database=DATABASE)
+        assert f"{TABLE} already exists" in caplog.text
+    finally:
+        # Clean up after test
+        sf_adapter.drop_schema(name=SCHEMA, database=DATABASE) 
+
+def test_drop_table(sf_adapter):
+    """Test whether snowflake_adapter.drop_table() successfully
+    drop specific table from snowflake warehouse."""
+    DATABASE, SCHEMA, TABLE = (
+        "SNOWSHU_DEVELOPMENT",
+        "_".join(["DROP_TABLE_TEST", generate_unique_uuid().upper()]),
+        "TEST_TABLE"
+    )
+    query = "SELECT 1 AS test_col"
+    try:
+        # Setup: Create schema and table
+        sf_adapter.generate_schema(name=SCHEMA, database=DATABASE)
+        if TABLE in sf_adapter._get_all_tables(DATABASE, SCHEMA):
+            sf_adapter.drop_table(name=TABLE, schema=SCHEMA, database=DATABASE)
+        sf_adapter.create_table(query, name=TABLE, schema=SCHEMA, database=DATABASE)
+
+        # Test table dropping
+        sf_adapter.drop_table(name=TABLE, schema=SCHEMA, database=DATABASE)
+        assert TABLE not in sf_adapter._get_all_tables(DATABASE, SCHEMA)
+    finally:
+        # Clean up: Drop schema cascade if it still exist
+        if SCHEMA in sf_adapter._get_all_schemas(DATABASE):
+            sf_adapter.drop_schema(name=SCHEMA, database=DATABASE)

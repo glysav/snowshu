@@ -93,7 +93,8 @@ def test_create_all_database_extensions(end_to_end):
     assert extensions in extensions_list
 
 
-def test_load_data_into_relation(end_to_end):
+def test_load_data_into_relation_relation(end_to_end):
+    """Tests that data is loaded into a relation from relation.data"""
     pg_adapter = PostgresAdapter(replica_metadata={})
     if pg_adapter.target != "localhost":
         pg_adapter._credentials.host = 'integration-test'
@@ -115,6 +116,29 @@ def test_load_data_into_relation(end_to_end):
     assert len(result) == 3
 
 
+def test_load_data_into_relation_dataframe(end_to_end):
+    """Tests that data is loaded into a relation from local dataframe"""
+    pg_adapter = PostgresAdapter(replica_metadata={})
+    if pg_adapter.target != "localhost":
+        pg_adapter._credentials.host = 'integration-test'
+
+    id_column = "id"
+    content_column = "content"
+    columns = [
+        Attribute(id_column, data_types.BIGINT),
+        Attribute(content_column, data_types.VARCHAR)
+    ]
+    relation = Relation("snowshu", "snowshu", "replica_meta", TABLE, columns)
+    query_data = DataFrame({id_column: [1, 2, 3], content_column: [rand_string(5) for _ in range(3)]})
+    pg_adapter.load_data_into_relation(relation, query_data)
+
+    statement = "SELECT * FROM snowshu.snowshu.replica_meta"
+    conn = pg_adapter.get_connection()
+    result = conn.execute(statement).fetchall()
+
+    assert len(result) == 3
+
+
 @mock.patch('snowshu.core.docker.DOCKER_REPLICA_VOLUME', 'snowshu_container_share_validations')
 def test_restore_data_from_shared_replica(docker_flush):
     shdocker = SnowShuDocker()
@@ -122,7 +146,7 @@ def test_restore_data_from_shared_replica(docker_flush):
     target_container, _ = shdocker.startup(
         target_adapter,
         'SnowflakeAdapter',
-        [LOCAL_ARCHITECTURE],
+        [LOCAL_ARCHITECTURE.value],
         envars=['POSTGRES_USER=snowshu',
                 'POSTGRES_PASSWORD=snowshu',
                 'POSTGRES_DB=snowshu',
@@ -155,7 +179,7 @@ def test_restore_data_from_shared_replica(docker_flush):
     target_container, _ = shdocker.startup(
         target_adapter,
         'SnowflakeAdapter',
-        [LOCAL_ARCHITECTURE],
+        [LOCAL_ARCHITECTURE.value],
         envars=['POSTGRES_USER=snowshu',
                 'POSTGRES_PASSWORD=snowshu',
                 'POSTGRES_DB=snowshu',
@@ -179,14 +203,14 @@ def test_initialize_replica(docker_flush):
 
             pg_adapter = PostgresAdapter(replica_metadata={})
             pg_adapter._credentials.host = 'snowshu_replica-integration-test'
-            pg_adapter.target_arch = [LOCAL_ARCHITECTURE]
+            pg_adapter.target_arch = [LOCAL_ARCHITECTURE.value]
 
             pg_adapter.initialize_replica(source_adapter_name='SnowflakeAdapter')
 
             # check if container with name snowshu_replica-integration-test exists
             client = docker.from_env()
-            assert client.containers.get(f'snowshu_replica-integration-test_{LOCAL_ARCHITECTURE}')
+            assert client.containers.get(f'snowshu_replica-integration-test_{LOCAL_ARCHITECTURE.value}')
 
             # check if it has dependencies installed
-            container = client.containers.get(f'snowshu_replica-integration-test_{LOCAL_ARCHITECTURE}')
+            container = client.containers.get(f'snowshu_replica-integration-test_{LOCAL_ARCHITECTURE.value}')
             assert container.exec_run('psql --version').exit_code == 0

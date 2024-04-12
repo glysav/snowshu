@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 from urllib.parse import quote
 
 import pandas as pd
@@ -44,7 +44,6 @@ class SnowflakeAdapter(BaseSourceAdapter):
     ALLOWED_CREDENTIALS = (SCHEMA, WAREHOUSE, ROLE,)
     # snowflake in-db is UPPER, but connector is actually lower :(
     DEFAULT_CASE = 'upper'
-    SNOWFLAKE_MAX_NUMBER_EXPR = 16384
 
     DATA_TYPE_MAPPINGS = {
         "array": dtypes.JSON,
@@ -102,6 +101,118 @@ class SnowflakeAdapter(BaseSourceAdapter):
         logger.debug(
             f'Done. Found {len(schemas)} schemas in {database} database.')
         return schemas
+
+    def _get_all_tables(self, database: str, schema: str) -> List[str]:
+        database = self.quoted(database)
+        schema = self.quoted(schema)
+        logger.debug(f'Collecting tables from {schema} schema in {database} database in snowflake...')
+        show_result = self._safe_query(f'SHOW TERSE TABLES IN SCHEMA {database}.{schema}')['name'].tolist()
+        tables = list(set(show_result))
+        logger.debug(f'Done. Found {len(tables)} tables in {schema} schema of {database} database.')
+        return tables
+
+    def generate_schema(self, name: str, database: str = 'SNOWSHU'):
+        """Create a schema in the specified database.
+
+            Args:
+                name: The name of the schema to create.
+                database: The database where the schema will be created.
+                          Defaults to 'SNOWSHU'.
+        """
+
+        corrected_database, corrected_name = (
+            self._correct_case(x) for x in (database, name))
+        try:
+            logger.debug("Creating a schema %s in %s database...",
+                         corrected_name, corrected_database)
+            query = f'''CREATE TRANSIENT SCHEMA IF NOT EXISTS
+                    {corrected_database}.{corrected_name}'''
+            result = self._safe_query(query)
+            logger.info("Schema creation result: %s", result['status'][0])
+        except ValueError as err:
+            error_message = (
+                f"An error occurred while creating the schema {corrected_name} "
+                f"in database {corrected_database}: {err}"
+            )
+            logger.error(error_message)
+            raise
+
+    def drop_schema(self, name: str, database: str = 'SNOWSHU'):
+        """Drop a schema and all of its contained objects (tables, views,
+        stored procedures)
+
+            Args:
+                name: The name of the schema to drop
+                database: The database name where the schema is located.
+                            Defaults to SNOWSHU.
+        """
+        corrected_database, corrected_name = (
+            self._correct_case(x) for x in (database, name))
+        try:
+            logger.debug("Creating a schema %s in %s database...",
+                         corrected_name, corrected_database)
+            query = f'''DROP SCHEMA IF EXISTS
+                    {corrected_database}.{corrected_name}
+                    CASCADE'''
+            result = self._safe_query(query)
+            logger.info("Schema drop result: %s", result["status"][0])
+        except ValueError as err:
+            error_message = (
+                f"An error occurred while dropping the schema {corrected_name} "
+                f"in database {corrected_database}: {err}"
+            )
+            logger.error(error_message)
+            raise
+
+    def create_table(self, query: str, name: str, schema: str, database: str = 'SNOWSHU'):
+        corrected_name, corrected_schema, corrected_database = (
+            self._correct_case(x) for x in (name, schema, database)
+        )
+        full_query = f'''CREATE TRANSIENT TABLE IF NOT EXISTS
+            {corrected_database}.{corrected_schema}.{corrected_name}
+            AS {query}'''
+        try:
+            logger.debug(
+                "Creating table %s in %s.%s...",
+                corrected_name,
+                corrected_schema,
+                corrected_database,
+            )
+            result = self._safe_query(full_query)
+            if "already exists" in result['status'][0]:
+                logger.warning(
+                    "Table %s already exists in %s.%s, skipping creation...",
+                    corrected_name,
+                    corrected_schema,
+                    corrected_database,
+                )
+            else:
+                logger.info("Table creation result: %s", result['status'][0])
+        except ValueError as err:
+            error_message = (
+                f"An error occurred while creating the table {corrected_name} "
+                f"in database {corrected_database}: {err}"
+            )
+            logger.error(error_message)
+            raise
+
+    def drop_table(self, name: str, schema: str, database: str = 'SNOWSHU'):
+        corrected_name, corrected_schema, corrected_database = (
+            self._correct_case(x) for x in (name, schema, database)
+        )
+        query = f'''DROP TABLE IF EXISTS
+            {corrected_database}.{corrected_schema}.{corrected_name}'''
+        try:
+            logger.debug("Dropping table %s in %s.%s...",
+                         corrected_name, corrected_schema, corrected_database)
+            result = self._safe_query(query)
+            logger.info("Table drop result: %s", result["status"][0])
+        except ValueError as err:
+            error_message = (
+                f"An error occurred while dropping the table {corrected_name} "
+                f"in database {corrected_database}: {err}")
+            logger.error(error_message)
+            raise
 
     @staticmethod
     def population_count_statement(relation: Relation) -> str:
@@ -236,49 +347,84 @@ LIMIT {max_number_of_outliers})
         return f" {local_key} in (SELECT {remote_key} FROM \
                 {adapter.quoted_dot_notation(relation)})"
 
-    @staticmethod
-    def predicate_constraint_statement(relation: Relation,
-                                       analyze: bool,
-                                       local_key: str,
-                                       remote_key: str) -> str:
-        """builds 'where' strings"""
-        constraint_sql = str()
-        if analyze:
-            constraint_sql = f" SELECT {remote_key} AS {local_key} FROM ({relation.core_query})"
-        else:
-
-            def quoted(val: Any) -> str:
-                return f"'{val}'" if relation.lookup_attribute(
-                    remote_key).data_type.requires_quotes else str(val)
-            try:
-                constraint_set = [
-                    quoted(val) for val in relation.data[remote_key].dropna().unique()
-                ][:SnowflakeAdapter.SNOWFLAKE_MAX_NUMBER_EXPR]
-                constraint_sql = ','.join(constraint_set)
-                if len(constraint_set) == 0:
-                    raise ValueError(f"The [{constraint_set}] constraint set is empty.")
-            except KeyError as err:
+    def _validate_key_index_error(self,
+                                  relation: Relation,
+                                  constraint: str,
+                                  remote_key: str) -> None:
+        """
+        Validate that the constraint contains a valid key for the relation
+        and the result of it is not an empty set.
+        """
+        try:
+            # Run exists query to avoid keeping large objects in memory
+            exists_query = (
+                f"SELECT EXISTS ({constraint})"
+            )
+            result = self._safe_query(exists_query)
+            if result.empty:
                 logger.critical(
-                    f'failed to build predicates for {relation.dot_notation}: '
-                    f'remote key {remote_key} not in dataframe columns ({relation.data.columns})')
-                raise err
-            except ValueError as err:
-                logger.critical(
-                    f'failed to build predicates for {relation.dot_notation}: '
-                    f'the constraint set is empty, please validate the relation.'
+                    "Failed to build predicates for %s: the constraint set "
+                    "is empty, please validate the relation.",
+                    constraint,
                 )
-                raise err
+                raise IndexError("Failed to build predicates, the constraint set is empty.")
+        except KeyError as err:
+            logger.critical(
+                "Failed to build predicates for %s: remote key %s not in %s table.",
+                relation.dot_notation,
+                constraint,
+                relation.temp_dot_notation,
+            )
+            raise KeyError(
+                f"Remote key {remote_key} not found in {relation.temp_dot_notation} table."
+            ) from err
 
-        return f"{local_key} IN ({constraint_sql}) "
+    def format_remote_key(self, relation: Relation, remote_key: str) -> str:
+        """Formats the remote key based on whether it needs to be quoted or not."""
+        attribute = relation.lookup_attribute(remote_key)
+        # If the data type does not require quotes, we need to cast it to VARCHAR
+        # as it lets us avoid type mismatch eg. when comparing a VARCHAR to a NUMBER
+        # though the opposite comparison is allowed.
+        if not attribute.data_type.requires_quotes:
+            logger.debug("Casting remote key %s to VARCHAR.", remote_key)
+            return f"{remote_key}::VARCHAR"
+        return remote_key
 
-    @staticmethod
-    def polymorphic_constraint_statement(relation: Relation,  # noqa pylint: disable=too-many-arguments
+    def predicate_constraint_statement(
+        self, relation: Relation, analyze: bool, local_key: str, remote_key: str
+    ) -> str:
+        """Builds 'where' strings."""
+        try:
+            formatted_remote_key = self.format_remote_key(relation, remote_key)
+            if analyze:
+                return (
+                    f"{local_key} IN ( SELECT {formatted_remote_key} AS {local_key} "
+                    f"FROM ({relation.core_query}))"
+                )
+
+            constraint_query = (
+                f"    SELECT DISTINCT {formatted_remote_key} "
+                f"    FROM {relation.temp_dot_notation} "
+            )
+            self._validate_key_index_error(relation, constraint_query, remote_key)
+            return f"{local_key} IN ({constraint_query})"
+        except Exception as err:
+            logger.critical(
+                "An unexpected error occurred while building predicates for %s: %s",
+                relation.dot_notation,
+                str(err),
+            )
+            raise
+
+    # pylint: disable=too-many-arguments
+    def polymorphic_constraint_statement(self,
+                                         relation: Relation,
                                          analyze: bool,
                                          local_key: str,
                                          remote_key: str,
                                          local_type: str,
                                          local_type_match_val: str = None) -> str:
-        predicate = SnowflakeAdapter.predicate_constraint_statement(relation, analyze, local_key, remote_key)
+        predicate = self.predicate_constraint_statement(relation, analyze, local_key, remote_key)
         if local_type_match_val:
             type_match_val = local_type_match_val
         else:
@@ -433,13 +579,11 @@ LIMIT {max_number_of_outliers})
                 'Adapter.get_connection called before setting Adapter.credentials')
 
         logger.debug(f'Acquiring {self.CLASSNAME} connection...')
-        overrides = dict(       # noqa pylint: disable=redefined-outer-name 
-            (k,
-             v) for (
-                k,
-                v) in dict(
-                database=database_override,
-                schema=schema_override).items() if v is not None)
+        overrides = {  # noqa pylint: disable=redefined-outer-name
+            'database': database_override,
+            'schema': schema_override
+        }
+        overrides = {k: v for k, v in overrides.items() if v is not None}
 
         engine = sqlalchemy.create_engine(
             self._build_conn_string(overrides), poolclass=NullPool)
