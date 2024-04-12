@@ -192,10 +192,13 @@ class BaseTargetAdapter(BaseSQLAdapter):  # noqa pylint: disable=too-many-instan
                 self.DOCKER_SNOWSHU_ENVARS))
 
         logger.info('Container initialized.')
+        self.shdocker.docker_containers_ls()
         while not self.target_database_is_ready():
             sleep(.5)
 
+        self.shdocker.docker_containers_ls()
         self._initialize_snowshu_meta_database()
+        self.shdocker.docker_containers_ls()
 
     def target_database_is_ready(self) -> bool:
         return self.container.exec_run(
