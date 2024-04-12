@@ -23,7 +23,7 @@ DEFAULT_TEMPORARY_DATABASE = 'SNOWSHU'
 
 
 def _is_in_docker() -> bool:
-    return False
+    # return False
     # running horizontal,
     # this should work for Unix AND Windows
     # https://stackoverflow.com/questions/36765138/bind-to-docker-socket-on-windows
